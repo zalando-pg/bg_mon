@@ -188,29 +188,27 @@ static bool check_bucket_time(struct aggregated_stats *agg, time_t tm)
 
 static bool send_aggregated_data(struct evhttp_request *req, struct aggregated_stats *agg, time_t tm)
 {
-	bool ret = false;
-	struct evbuffer *evb;
+	struct evbuffer *evb = NULL;
 
 	pthread_mutex_lock(&agg_lock);
-	if ((ret = agg != NULL)) {
-		if (check_bucket_time(agg, tm)) {
-			if (!agg->state.is_flushed && !agg->state.is_finished)
-				brotli_compress_data(&agg->state, NULL, 0, BROTLI_OPERATION_FLUSH);
+	if (agg != NULL && check_bucket_time(agg, tm)) {
+		if (!agg->state.is_flushed && !agg->state.is_finished)
+			brotli_compress_data(&agg->state, NULL, 0, BROTLI_OPERATION_FLUSH);
 
-			evb = evbuffer_new();
-			evbuffer_add(evb, agg->state.to, agg->state.pos);
-		} else ret = false;
+		evb = evbuffer_new();
+		evbuffer_add(evb, agg->state.to, agg->state.pos);
 	}
 	pthread_mutex_unlock(&agg_lock);
 
-	if (ret) {
+	if (evb != NULL) {
 		struct evkeyvalq *output_headers = evhttp_request_get_output_headers(req);
 		evhttp_add_header(output_headers, "Content-Type", "application/json");
 		evhttp_add_header(output_headers, "Content-Encoding", "br");
 		evhttp_send_reply(req, 200, "OK", evb);
 		evbuffer_free(evb);
+		return true;
 	}
-	return ret;
+	return false;
 }
 #endif
 
@@ -319,9 +317,13 @@ static const char *process_type(pg_stat_activity p)
 		QUOTE(STATS_COLLECTOR_PROC_NAME),
 		QUOTE(LOGGER_PROC_NAME),
 		QUOTE(STANDALONE_BACKEND_PROC_NAME),
+		QUOTE(SLOTSYNC_WORKER_PROC_NAME),
+		QUOTE(WAL_SUMMARIZER_PROC_NAME),
 		QUOTE(PARALLEL_WORKER_NAME),
 		QUOTE(LOGICAL_LAUNCHER_NAME),
-		QUOTE(LOGICAL_WORKER_NAME)
+		QUOTE(LOGICAL_TABLESYNC_WORKER_NAME),
+		QUOTE(LOGICAL_APPLY_WORKER_NAME),
+		QUOTE(LOGICAL_PARALLEL_WORKER_NAME)
 	};
 
 	if (p.type == PG_BG_WORKER)
@@ -332,7 +334,7 @@ static const char *process_type(pg_stat_activity p)
 
 static const char *get_query(pg_stat_activity s)
 {
-	if (s.type == PG_LOGICAL_WORKER)
+	if (s.type >= PG_LOGICAL_TABLESYNC_WORKER)
 		return s.ps.cmdline;
 
 	switch (s.state)

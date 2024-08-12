@@ -751,7 +751,17 @@ static void merge_stats(pg_stat_activity_list *pg_stats, proc_stat_list proc_sta
 
 #define PARALLEL_WORKER_PROC_NAME PARALLEL_WORKER_NAME " for PID"
 #define LOGICAL_LAUNCHER_PROC_NAME LOGICAL_LAUNCHER_NAME SUFFIX_PATTERN
-#define LOGICAL_WORKER_PROC_NAME LOGICAL_WORKER_NAME " for"
+#if PG_VERSION_NUM >= 170000
+#define LOGICAL_TABLESYNC_WORKER_PROC_NAME "logical replication tablesync worker for"
+#else
+#define LOGICAL_TABLESYNC_WORKER_PROC_NAME "logical replication worker for"
+#endif
+#if PG_VERSION_NUM < 160000
+#define LOGICAL_APPLY_WORKER_PROC_NAME "logical replication worker for"
+#else
+#define LOGICAL_APPLY_WORKER_PROC_NAME "logical replication apply worker for"
+#endif
+#define LOGICAL_PARALLEL_WORKER_PROC_NAME "logical replication parallel apply worker for"
 
 #define BACKEND_ENTRY(CMDLINE_PATTERN, TYPE) TAB_ENTRY(CMDLINE_PATTERN " ", PG_##TYPE)
 
@@ -785,7 +795,6 @@ static void merge_stats(pg_stat_activity_list *pg_stats, proc_stat_list proc_sta
 
 static PgBackendType parse_cmdline(const char * const buf, const char **rest)
 {
-	PgBackendType type = PG_UNDEFINED;
 	*rest = buf;
 	if (strncmp(buf, cmdline_prefix, cmdline_prefix_len) == 0) {
 		int j;
@@ -806,7 +815,11 @@ static PgBackendType parse_cmdline(const char * const buf, const char **rest)
 #endif
 #if PG_VERSION_NUM >= 100000
 			BGWORKER(LOGICAL_LAUNCHER),
-			BGWORKER(LOGICAL_WORKER),
+			BGWORKER(LOGICAL_APPLY_WORKER),
+#endif
+#if PG_VERSION_NUM >= 160000
+			BGWORKER(LOGICAL_PARALLEL_WORKER),
+			BGWORKER(LOGICAL_TABLESYNC_WORKER),
 #endif
 #if PG_VERSION_NUM < 110000
 			OTH_BACKEND(BG_WORKER),
@@ -816,28 +829,35 @@ static PgBackendType parse_cmdline(const char * const buf, const char **rest)
 			AUX_BACKEND(STATS_COLLECTOR),
 			AUX_BACKEND(WAL_WRITER),
 			AUX_BACKEND(BG_WRITER),
+#if PG_VERSION_NUM >= 170000
+			AUX_BACKEND(SLOTSYNC_WORKER),
+			AUX_BACKEND(WAL_SUMMARIZER),
+#endif
 			OTH_BACKEND(UNKNOWN),
 			{NULL, 0, PG_UNDEFINED}
 		};
 
 		for (j = 0; backend_tab[j].name != NULL; ++j)
 			if (strncmp(cmd, backend_tab[j].name, backend_tab[j].name_len) == 0) {
-				type = backend_tab[j].type;
 				*rest = cmd + backend_tab[j].name_len;
-				break;
+#if PG_VERSION_NUM < 160000
+				if (backend_tab[j].type == PG_LOGICAL_APPLY_WORKER && strstr(*rest, " sync "))
+					return PG_LOGICAL_TABLESYNC_WORKER;
+#endif
+				return backend_tab[j].type;
 			}
 
 #if PG_VERSION_NUM >= 110000
-		if (backend_tab[j].name == NULL) {
+		{
 			size_t len = strlen(cmd) - sizeof(SUFFIX_PATTERN);
 			if (len > 0 && strcmp(cmd + len, " " SUFFIX_PATTERN) == 0) {
-				type = PG_BG_WORKER;
 				*rest = cmd;
+				return PG_BG_WORKER;
 			}
 		}
 #endif
 	}
-	return type;
+	return PG_UNDEFINED;
 }
 
 static void read_proc_cmdline(pg_stat_activity *stat)
@@ -868,7 +888,7 @@ static void read_proc_cmdline(pg_stat_activity *stat)
 					rest += len + 1;
 			}
 			stat->query = json_escape_string(rest);
-		} else if ((type == PG_LOGICAL_WORKER || type == PG_BG_WORKER) && *rest)
+		} else if ((type >= PG_LOGICAL_TABLESYNC_WORKER || type == PG_BG_WORKER) && *rest)
 			stat->ps.cmdline = json_escape_string_len(rest, strlen(rest) - sizeof(SUFFIX_PATTERN));
 		else if (type == PG_PARALLEL_WORKER && *rest)
 			stat->parent_pid = strtoul(rest, NULL, 10);
@@ -906,7 +926,7 @@ static void diff_pg_stat_activity(pg_stat_activity_list old_activity, pg_stat_ac
 				old_activity.values[old_pos].ps.free_cmdline = true;
 			else if (old_activity.values[old_pos].type != PG_UNDEFINED && new_activity.values[new_pos].type == PG_UNDEFINED) {
 				new_activity.values[new_pos].type = old_activity.values[old_pos].type;
-				if (new_activity.values[new_pos].type == PG_LOGICAL_WORKER || new_activity.values[new_pos].type == PG_BG_WORKER)
+				if (new_activity.values[new_pos].type >= PG_LOGICAL_TABLESYNC_WORKER || new_activity.values[new_pos].type == PG_BG_WORKER)
 					new_activity.values[new_pos].ps.cmdline = old_activity.values[old_pos].ps.cmdline;
 			}
 
@@ -1011,10 +1031,16 @@ static PgBackendType map_backend_type(BackendType type)
 		case B_STANDALONE_BACKEND:
 			return PG_STANDALONE_BACKEND;
 #endif
+#if PG_VERSION_NUM >= 170000
+		case B_SLOTSYNC_WORKER:
+			return PG_SLOTSYNC_WORKER;
+		case B_WAL_SUMMARIZER:
+			return PG_WAL_SUMMARIZER;
+#endif
 		case B_BG_WORKER:
-		default:
-			return PG_UNDEFINED;
+			break;
 	}
+	return PG_UNDEFINED;
 }
 #endif
 
@@ -1141,7 +1167,9 @@ static void get_pg_stat_activity(pg_stat_activity_list *pg_stats)
 
 	if (init_postgres)
 	{
-#if PG_VERSION_NUM >= 150000
+#if PG_VERSION_NUM >= 170000
+		InitPostgres("postgres", InvalidOid, NULL, InvalidOid, 0, NULL);
+#elif PG_VERSION_NUM >= 150000
 		InitPostgres("postgres", InvalidOid, NULL, InvalidOid, false, false, NULL);
 #elif PG_VERSION_NUM >= 110000
 		InitPostgres("postgres", InvalidOid, NULL, InvalidOid, NULL, false);
